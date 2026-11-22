@@ -1,112 +1,131 @@
-"""The picture that tastes of one ingredient.
+#!/usr/bin/env python3
+"""Picture that tastes of one ingredient -- round 2.
 
-Writes one image to /output/entry.png: a macro close-up of golden
-honeycomb dripping warm honey -- a single ingredient, honey, shown at
-its most appetising: gloss, drip, warm light, nothing else in frame.
+The entry is one photograph of a single ripe Alphonso mango slice:
+orange flesh, juice beading on the cut face, warm side light, dark
+background, nothing else in the frame. One ingredient, mango, shown so
+you can almost taste it.
 
-The picture is bundled with this program as honeycomb.jpg (a 1024x1024
-JPEG, 257,995 bytes, well inside the 1 MiB gate). This program copies
-those exact bytes to /output/entry.png, after verifying the bundled
-asset itself: it parses the JPEG header to confirm the dimensions and
-checks the byte size against the competition limits, so a damaged or
-oversized asset fails loudly instead of producing a bad entry.
+The photograph ships in this repository as ``mango.jpg``. This script
+does one job: it checks that bundled file against the competition gate
+and copies its bytes, unchanged, to the output path the grader reads
+(``/output/entry.png`` by default, or ``$MAKEFUN_OUTPUT_DIR`` when
+the harness sets it).
 
-Standard library only. No network, no randomness, no clock: run it
-twice and the output is byte-identical.
+Only the Python standard library is used. There is no network, no
+clock and no randomness anywhere, so every run writes exactly the
+same bytes.
 """
 
-import hashlib
+from __future__ import annotations
+
 import os
-import struct
 import sys
+from dataclasses import dataclass
+from pathlib import Path
 
-ASSET_NAME = "honeycomb.jpg"
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", "/output")
-OUTPUT_NAME = "entry.png"
-
-MAX_BYTES = 1_048_576
-MAX_WIDTH = 1024
-MAX_HEIGHT = 1024
-
-
-def asset_path() -> str:
-    """Path of the bundled picture, next to this file."""
-    here = os.path.dirname(os.path.abspath(__file__))
-    return os.path.join(here, ASSET_NAME)
+PICTURE_FILE = "mango.jpg"
+RESULT_FILE = "entry.png"
+BYTE_CEILING = 1_048_576
+SIDE_CEILING = 1024
 
 
-def jpeg_dimensions(data: bytes) -> tuple[int, int]:
-    """Read width and height out of a JPEG's SOF marker, stdlib only.
+@dataclass(frozen=True)
+class Gate:
+    """The competition's limits for the delivered image."""
 
-    Walks the marker segments from the SOI marker until it finds a
-    Start-Of-Frame segment (baseline or progressive) and reads the
-    height and width stored there, big-endian, 16 bits each.
+    max_bytes: int = BYTE_CEILING
+    max_side: int = SIDE_CEILING
+
+
+@dataclass
+class Picture:
+    """A bundled JPEG plus the size the gate measured for it."""
+
+    blob: bytes
+    width: int
+    height: int
+
+    @property
+    def nbytes(self) -> int:
+        return len(self.blob)
+
+
+def _sof_dimensions(blob: bytes) -> tuple[int, int]:
+    """Pull (width, height) from a JPEG's first Start-Of-Frame segment.
+
+    JPEG files are a chain of segments; each starts with 0xFF, a marker
+    byte, then a big-endian length (except the freestanding markers,
+    which carry no length). The SOF segment stores height then width
+    as two big-endian 16-bit values after its precision byte.
     """
-    if len(data) < 4 or data[0:2] != b"\xff\xd8":
-        raise ValueError("asset is not a JPEG (missing SOI marker)")
-    pos = 2
-    while pos + 9 <= len(data):
-        if data[pos] != 0xFF:
-            raise ValueError(f"bad marker prefix at offset {pos}")
-        marker = data[pos + 1]
-        # Standalone markers carry no length field; skip past them.
-        if marker in (0x01, 0xD0, 0xD1, 0xD2, 0xD3,
-                      0xD4, 0xD5, 0xD6, 0xD7, 0xD8):
-            pos += 2
+    if blob[:2] != b"\xff\xd8":
+        raise ValueError("bundled picture is not a JPEG")
+    cursor = 2
+    end = len(blob)
+    freestanding = {0x01, 0xD8} | set(range(0xD0, 0xD8))
+    frame_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
+                     0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    while cursor + 4 <= end:
+        if blob[cursor] != 0xFF:
+            raise ValueError("corrupt JPEG marker stream")
+        code = blob[cursor + 1]
+        if code == 0xFF:  # padding byte: step over it and keep looking
+            cursor += 1
             continue
-        (length,) = struct.unpack(">H", data[pos + 2:pos + 4])
-        if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
-                      0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
-            height, width = struct.unpack(">HH", data[pos + 5:pos + 9])
-            return width, height
-        pos += 2 + length
-    raise ValueError("no SOF marker found in JPEG")
+        if code in freestanding:
+            cursor += 2
+            continue
+        seg_len = (blob[cursor + 2] << 8) | blob[cursor + 3]
+        if code in frame_markers:
+            tall = (blob[cursor + 5] << 8) | blob[cursor + 6]
+            wide = (blob[cursor + 7] << 8) | blob[cursor + 8]
+            return wide, tall
+        cursor += 2 + seg_len
+    raise ValueError("JPEG has no Start-Of-Frame segment")
 
 
-def check_asset(data: bytes) -> tuple[int, int]:
-    """Enforce the competition gate on the bundled bytes before writing."""
-    if len(data) == 0:
-        raise ValueError("bundled asset is empty")
-    if len(data) > MAX_BYTES:
+def load_picture(folder: Path) -> Picture:
+    """Read the bundled picture and measure it."""
+    blob = (folder / PICTURE_FILE).read_bytes()
+    wide, tall = _sof_dimensions(blob)
+    return Picture(blob=blob, width=wide, height=tall)
+
+
+def passes_gate(picture: Picture, gate: Gate) -> None:
+    """Raise unless the picture fits every limit the gate sets."""
+    if picture.nbytes == 0:
+        raise ValueError("bundled picture is empty")
+    if picture.nbytes > gate.max_bytes:
         raise ValueError(
-            f"bundled asset is {len(data)} bytes, over the "
-            f"{MAX_BYTES} byte limit")
-    width, height = jpeg_dimensions(data)
-    if width > MAX_WIDTH or height > MAX_HEIGHT:
+            f"bundled picture is {picture.nbytes} bytes, "
+            f"above the {gate.max_bytes} byte ceiling")
+    if picture.width > gate.max_side or picture.height > gate.max_side:
         raise ValueError(
-            f"bundled asset is {width}x{height}, over the "
-            f"{MAX_WIDTH}x{MAX_HEIGHT} limit")
-    return width, height
+            f"bundled picture is {picture.width}x{picture.height}, "
+            f"above the {gate.max_side}x{gate.max_side} ceiling")
 
 
-def main() -> int:
-    path = asset_path()
-    with open(path, "rb") as handle:
-        data = handle.read()
+def deliver(picture: Picture, outdir: Path) -> Path:
+    """Write the picture bytes to the output file and read them back."""
+    outdir.mkdir(parents=True, exist_ok=True)
+    target = outdir / RESULT_FILE
+    target.write_bytes(picture.blob)
+    if target.read_bytes() != picture.blob:
+        raise ValueError("output file does not match the bundled picture")
+    return target
 
-    width, height = check_asset(data)
-    digest = hashlib.sha256(data).hexdigest()
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, OUTPUT_NAME)
-    with open(out_path, "wb") as handle:
-        handle.write(data)
-
-    # Read the output back and prove it is exactly the verified asset:
-    # a short write, a disk hiccup or a stray byte must fail here,
-    # never silently ship a different picture to the judge.
-    with open(out_path, "rb") as handle:
-        written = handle.read()
-    if hashlib.sha256(written).hexdigest() != digest:
-        raise ValueError("output differs from the verified asset")
-    if len(written) > MAX_BYTES:
-        raise ValueError("output exceeds the 1 MiB limit")
-
-    print(f"asset: {ASSET_NAME} ({width}x{height}, {len(data)} bytes)")
-    print(f"sha256: {digest}")
-    print(f"wrote: {out_path} (verified identical)")
+def run() -> int:
+    folder = Path(__file__).resolve().parent
+    outdir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+    picture = load_picture(folder)
+    passes_gate(picture, Gate())
+    target = deliver(picture, outdir)
+    print(f"picture: {PICTURE_FILE} {picture.width}x{picture.height} "
+          f"{picture.nbytes} bytes -> {target}")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(run())
